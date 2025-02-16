@@ -1,0 +1,362 @@
+// src/utils/idb.js
+export const initDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('DownloadManager', 2);
+    
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('tasks')) {
+        const store = db.createObjectStore('tasks', {
+          keyPath: 'taskId'
+        });
+        store.createIndex('status', 'status', { unique: false });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = reject;
+  });
+};
+
+export const getAllTasks = async () => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('tasks', 'readonly');
+    const store = tx.objectStore('tasks');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = reject;
+  });
+};
+
+export const updateTask = async (task) => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('tasks', 'readwrite');
+    const store = tx.objectStore('tasks');
+    store.put(task);
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
+  });
+};
+
+export const deleteTask = async (taskId) => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('tasks', 'readwrite');
+    const store = tx.objectStore('tasks');
+    store.delete(taskId);
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
+  });
+};
+
+
+
+// src/workers/download.worker.js
+importScripts('https://cdn.jsdelivr.net/npm/streamsaver@2.0.6/StreamSaver.min.js');
+
+class DownloadTask {
+  constructor(taskId, url, filename) {
+    this.taskId = taskId;
+    this.url = url;
+    this.filename = filename;
+    this.controller = new AbortController();
+    this.writer = null;
+    this.downloaded = 0;
+    this.totalSize = 0;
+  }
+
+  async start() {
+    try {
+      // 获取文件信息
+      const headRes = await fetch(this.url, { 
+        method: 'HEAD',
+        signal: this.controller.signal 
+      });
+      
+      this.totalSize = parseInt(headRes.headers.get('Content-Length'));
+      const acceptRanges = headRes.headers.get('Accept-Ranges') === 'bytes';
+
+      if (!acceptRanges) {
+        throw new Error('Server does not support range requests');
+      }
+
+      // 初始化写入流
+      streamSaver.mitm = '/mitm.html'; // 根据实际路径配置
+      const fileStream = streamSaver.createWriteStream(this.filename, {
+        size: this.totalSize
+      });
+      this.writer = fileStream.getWriter();
+
+      // 发送初始化信息
+      self.postMessage({
+        type: 'init',
+        taskId: this.taskId,
+        totalSize: this.totalSize
+      });
+
+      // 开始分块下载
+      await this.downloadChunks();
+    } catch (error) {
+      this.handleError(error);
+    }
+  }
+
+  async downloadChunks() {
+    let startByte = await this.getResumePosition();
+    
+    while (startByte < this.totalSize) {
+      const response = await fetch(this.url, {
+        headers: { Range: `bytes=${startByte}-` },
+        signal: this.controller.signal
+      });
+
+      if (response.status !== 206) break;
+
+      const reader = response.body.getReader();
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        await this.writer.write(value);
+        startByte += value.byteLength;
+        this.downloaded = startByte;
+
+        self.postMessage({
+          type: 'progress',
+          taskId: this.taskId,
+          downloaded: startByte,
+          progress: (startByte / this.totalSize * 100).toFixed(1)
+        });
+      }
+    }
+
+    await this.writer.close();
+    self.postMessage({ 
+      type: 'complete',
+      taskId: this.taskId 
+    });
+  }
+
+  async getResumePosition() {
+    const response = await fetch(`/api/resume?taskId=${this.taskId}`);
+    const data = await response.json();
+    return data.downloaded || 0;
+  }
+
+  pause() {
+    this.controller.abort();
+    this.writer.abort();
+    self.postMessage({
+      type: 'paused',
+      taskId: this.taskId,
+      downloaded: this.downloaded
+    });
+  }
+
+  handleError(error) {
+    self.postMessage({
+      type: 'error',
+      taskId: this.taskId,
+      error: error.message
+    });
+  }
+}
+
+self.addEventListener('message', async (e) => {
+  const { type, taskId, url, filename } = e.data;
+  
+  if (type === 'start') {
+    const task = new DownloadTask(taskId, url, filename);
+    await task.start();
+  } else if (type === 'pause') {
+    // 需要实现暂停逻辑
+  }
+});
+
+
+
+// src/components/DownloadManager.jsx
+import { useEffect, useReducer, useRef } from 'react';
+import { getAllTasks, updateTask, deleteTask } from '../utils/idb';
+
+const initialState = {
+  tasks: {},
+  activeWorkers: new Map()
+};
+
+function reducer(state, action) {
+  switch (action.type) {
+    case 'INIT_TASKS':
+      return {
+        ...state,
+        tasks: action.payload.reduce((acc, task) => ({
+          ...acc,
+          [task.taskId]: task
+        }), {})
+      };
+    case 'ADD_TASK':
+      return {
+        ...state,
+        tasks: {
+          ...state.tasks,
+          [action.payload.taskId]: action.payload
+        }
+      };
+    case 'UPDATE_PROGRESS':
+      return {
+        ...state,
+        tasks: {
+          ...state.tasks,
+          [action.payload.taskId]: {
+            ...state.tasks[action.payload.taskId],
+            ...action.payload
+          }
+        }
+      };
+    case 'REMOVE_TASK':
+      const newTasks = { ...state.tasks };
+      delete newTasks[action.payload];
+      return { ...state, tasks: newTasks };
+    default:
+      return state;
+  }
+}
+
+const DownloadManager = () => {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const workers = useRef(new Map());
+
+  useEffect(() => {
+    const loadTasks = async () => {
+      const savedTasks = await getAllTasks();
+      dispatch({ type: 'INIT_TASKS', payload: savedTasks });
+    };
+    loadTasks();
+  }, []);
+
+  const startDownload = async (url, filename) => {
+    const taskId = generateUniqueId();
+    const worker = new Worker(
+      new URL('../workers/download.worker.js', import.meta.url)
+    );
+
+    worker.postMessage({
+      type: 'start',
+      taskId,
+      url,
+      filename
+    });
+
+    worker.onmessage = (e) => {
+      const { type, taskId, ...data } = e.data;
+      switch (type) {
+        case 'init':
+          dispatch({
+            type: 'ADD_TASK',
+            payload: {
+              taskId,
+              url,
+              filename,
+              status: 'downloading',
+              ...data
+            }
+          });
+          updateTask({
+            taskId,
+            url,
+            filename,
+            status: 'downloading',
+            ...data
+          });
+          break;
+        case 'progress':
+          dispatch({
+            type: 'UPDATE_PROGRESS',
+            payload: { taskId, ...data }
+          });
+          updateTask({
+            taskId,
+            ...state.tasks[taskId],
+            ...data
+          });
+          break;
+        case 'complete':
+          dispatch({ type: 'REMOVE_TASK', payload: taskId });
+          deleteTask(taskId);
+          worker.terminate();
+          break;
+        case 'error':
+          // 处理错误
+          break;
+      }
+    };
+
+    workers.current.set(taskId, worker);
+  };
+
+  const pauseDownload = (taskId) => {
+    const worker = workers.current.get(taskId);
+    if (worker) {
+      worker.postMessage({ type: 'pause', taskId });
+      dispatch({
+        type: 'UPDATE_PROGRESS',
+        payload: { taskId, status: 'paused' }
+      });
+      updateTask({
+        ...state.tasks[taskId],
+        status: 'paused'
+      });
+    }
+  };
+
+  const resumeDownload = async (taskId) => {
+    const task = state.tasks[taskId];
+    const worker = new Worker(
+      new URL('../workers/download.worker.js', import.meta.url)
+    );
+
+    worker.postMessage({
+      type: 'resume',
+      taskId,
+      url: task.url,
+      filename: task.filename,
+      downloaded: task.downloaded
+    });
+
+    // ...类似startDownload的消息处理...
+  };
+
+  return (
+    <div>
+      <button onClick={() => startDownload('URL1', 'file1.bin')}>
+        开始下载1
+      </button>
+      <button onClick={() => startDownload('URL2', 'file2.bin')}>
+        开始下载2
+      </button>
+
+      <div className="download-list">
+        {Object.values(state.tasks).map(task => (
+          <div key={task.taskId} className="download-item">
+            <div>{task.filename}</div>
+            <div>{task.progress}%</div>
+            {task.status === 'paused' ? (
+              <button onClick={() => resumeDownload(task.taskId)}>恢复</button>
+            ) : (
+              <button onClick={() => pauseDownload(task.taskId)}>暂停</button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+function generateUniqueId() {
+  return crypto.randomUUID(); // 需要浏览器支持
+}
+
+export default DownloadManager;
